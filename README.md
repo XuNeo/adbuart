@@ -2,7 +2,7 @@
 
 Expose an Android-device UART as a local PTY over `adb`, so host serial tools such as `minicom`, `picocom`, or pyserial can talk to it like a normal serial port.
 
-This is useful when a device has no host-side USB serial adapter and the RTOS console is reachable only through an Android UART device, for example `/dev/ttyHS1` on G2 Air style targets.
+This is useful when a device has no host-side USB serial adapter and the console is reachable only through an Android UART device.
 
 ## Requirements
 
@@ -22,23 +22,23 @@ python3 -m pip install adbuart
 Start the bridge in one terminal:
 
 ```bash
-adbuart -n g2air
+adbuart -n uart-console
 ```
 
 With multiple adb devices attached, pass the adb serial explicitly:
 
 ```bash
-adbuart -s d7a6340b -n g2air
+adbuart -s SERIAL -n uart-console
 ```
 
-The command creates `/tmp/g2air` and keeps running in the foreground. It prints a minicom command when the PTY is ready.
+The command creates `/tmp/uart-console` and keeps running in the foreground. It prints a minicom command when the PTY is ready.
 
 Open the PTY from another terminal:
 
 ```bash
-minicom -D /tmp/g2air -b 2000000
+minicom -D /tmp/uart-console -b 2000000
 # or
-python3 -m serial.tools.miniterm /tmp/g2air 2000000
+python3 -m serial.tools.miniterm /tmp/uart-console 2000000
 ```
 
 Stop the bridge with `Ctrl-C` in the bridge terminal. Clean shutdown restores RTOS logging when it was enabled before startup.
@@ -49,6 +49,7 @@ Run:
 
 ```bash
 adbuart --help
+adbuart --version
 ```
 
 Important options:

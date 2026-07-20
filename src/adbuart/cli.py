@@ -13,6 +13,11 @@ import termios
 import time
 import tty
 
+try:
+    from . import __version__
+except ImportError:  # pragma: no cover - direct script execution fallback
+    __version__ = "0.1.1"
+
 DEFAULT_REMOTE_TTY = "/dev/ttyHS1"
 DEFAULT_BAUD = "2000000"
 DEFAULT_CMD_BEFORE = "setprop persist.rtoslogd.uart 0"
@@ -41,8 +46,10 @@ def validate_name(name: str) -> str:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Expose an Android device UART as a local /tmp/<name> PTY over adb."
+        description="Expose an Android device UART as a local /tmp/<name> PTY over adb.",
+        epilog=f"version: {__version__}",
     )
+    parser.add_argument("--version", action="version", version=f"adbuart {__version__}")
     parser.add_argument(
         "-s",
         "--serial",
@@ -59,7 +66,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--cmd-after",
         action="append",
-        help=f"Remote shell command during teardown; repeatable (default: {DEFAULT_CMD_AFTER!r} when G2 logging was enabled)",
+        help=f"Remote shell command during teardown; repeatable (default: {DEFAULT_CMD_AFTER!r} when UART logging was enabled)",
     )
     return parser.parse_args(argv)
 
