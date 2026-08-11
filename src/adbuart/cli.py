@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import codecs
 import errno
 import fcntl
 import os
@@ -12,6 +13,9 @@ import sys
 import termios
 import time
 import tty
+
+import serial
+from serial.tools import miniterm
 
 try:
     from . import __version__
@@ -46,7 +50,7 @@ def validate_name(name: str) -> str:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Expose an Android device UART as a local /tmp/<name> PTY over adb.",
+        description="Open an Android device UART in miniterm, or expose it as a local PTY with --name.",
         epilog=f"version: {__version__}",
     )
     parser.add_argument("--version", action="version", version=f"adbuart {__version__}")
@@ -55,7 +59,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--serial",
         help="ADB serial, passed to every adb command with -s; auto-selects when exactly one device is connected",
     )
-    parser.add_argument("-n", "--name", required=True, type=validate_name, help="Local node name created as /tmp/<name>")
+    parser.add_argument("-n", "--name", type=validate_name, help="Create a local /tmp/<name> PTY instead of opening miniterm")
     parser.add_argument("--remote-tty", default=DEFAULT_REMOTE_TTY, help=f"Remote UART device path (default: {DEFAULT_REMOTE_TTY})")
     parser.add_argument("--baud", default=DEFAULT_BAUD, help=f"Remote UART baud rate for stty (default: {DEFAULT_BAUD})")
     parser.add_argument(
@@ -237,12 +241,12 @@ class Adb:
     def shell(self, command, check=True):
         return self.run("shell", command, check=check)
 
-    def popen_shell_t(self, command):
+    def popen_shell_t(self, command, stderr=subprocess.PIPE):
         return subprocess.Popen(
             build_adb_args(self.serial, "shell", "-T", command),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=stderr,
         )
 
 
@@ -365,6 +369,192 @@ def forward_loop(pty_fd, adb_proc, baud_sync=None):
                     raise EOFError(f"fd closed: {fd}")
 
 
+class AdbSerial:
+    def __init__(self, adb_proc, name, baudrate, set_baudrate=None):
+        self.adb_proc = adb_proc
+        self.name = name
+        self._baudrate = int(baudrate)
+        self._set_baudrate = set_baudrate
+        self.bytesize = serial.EIGHTBITS
+        self.parity = serial.PARITY_NONE
+        self.stopbits = serial.STOPBITS_ONE
+        self.xonxoff = False
+        self.rtscts = False
+        self.rts = False
+        self.dtr = False
+        self.break_condition = False
+        self.is_open = True
+        self._cancel_read = False
+
+    @property
+    def baudrate(self):
+        return self._baudrate
+
+    @baudrate.setter
+    def baudrate(self, value):
+        value = int(value)
+        if value < 0:
+            raise ValueError(f"Not a valid baudrate: {value!r}")
+        if self._set_baudrate is not None:
+            try:
+                self._set_baudrate(value)
+            except Exception as exc:
+                raise serial.SerialException(f"failed to set remote baudrate {value}: {exc}") from exc
+        self._baudrate = value
+
+    @property
+    def in_waiting(self):
+        if self.adb_proc.poll() is not None:
+            return 0
+        try:
+            available = fcntl.ioctl(self.adb_proc.stdout.fileno(), termios.FIONREAD, b"\0\0\0\0")
+        except (AttributeError, OSError):
+            return 0
+        return int.from_bytes(available, byteorder=sys.byteorder)
+
+    @property
+    def cts(self):
+        return False
+
+    @property
+    def dsr(self):
+        return False
+
+    @property
+    def ri(self):
+        return False
+
+    @property
+    def cd(self):
+        return False
+
+    def read(self, size=1):
+        if self._cancel_read:
+            self._cancel_read = False
+            return b""
+        try:
+            stdout_fd = self.adb_proc.stdout.fileno()
+        except (AttributeError, OSError, ValueError):
+            data = self.adb_proc.stdout.read(size)
+        else:
+            poller = select.poll()
+            poller.register(stdout_fd, select.POLLIN | select.POLLERR | select.POLLHUP)
+            if not poller.poll(100):
+                return b""
+            while True:
+                try:
+                    data = os.read(stdout_fd, size)
+                    break
+                except InterruptedError:
+                    continue
+        if not data:
+            raise serial.SerialException("ADB UART stream closed")
+        return data
+
+    def write(self, data):
+        if self.adb_proc.poll() is not None:
+            raise serial.SerialException("ADB UART stream closed")
+        try:
+            written = self.adb_proc.stdin.write(data)
+            self.adb_proc.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            raise serial.SerialException(f"failed to write ADB UART stream: {exc}") from exc
+        if written is None:
+            return len(data)
+        return written
+
+    def flush(self):
+        self.adb_proc.stdin.flush()
+
+    def cancel_read(self):
+        self._cancel_read = True
+
+    def close(self):
+        self.is_open = False
+        if self.adb_proc.poll() is None:
+            self.adb_proc.terminate()
+
+
+class AdbMiniterm(miniterm.Miniterm):
+    def reader(self):
+        try:
+            while self.alive and self._reader_alive:
+                data = self.serial.read(self.serial.in_waiting or 1)
+                if data:
+                    if self.raw:
+                        self.console.write_bytes(data)
+                    else:
+                        text = self.rx_decoder.decode(data)
+                        for transformation in self.rx_transformations:
+                            text = transformation.rx(text)
+                        self.console.write(text)
+        except Exception as exc:
+            self.reader_error = exc
+            self.alive = False
+
+    def writer(self):
+        menu_active = False
+        input_decoder = codecs.getincrementaldecoder(sys.stdin.encoding or "UTF-8")("replace")
+        poller = select.poll()
+        poller.register(self.console.fd, select.POLLIN | select.POLLERR | select.POLLHUP)
+        try:
+            while self.alive:
+                events = poller.poll(100)
+                if not events:
+                    continue
+                if events[0][1] & (select.POLLERR | select.POLLHUP):
+                    self.alive = False
+                    break
+                data = os.read(self.console.fd, COPY_SIZE)
+                if not data:
+                    self.alive = False
+                    break
+                for key in input_decoder.decode(data):
+                    if key == "\x7f":
+                        key = "\x08"
+                    if not self.alive:
+                        break
+                    if menu_active:
+                        self.handle_menu_key(key)
+                        menu_active = False
+                    elif key == self.menu_character:
+                        menu_active = True
+                    elif key == self.exit_character:
+                        self.stop()
+                    else:
+                        text = key
+                        for transformation in self.tx_transformations:
+                            text = transformation.tx(text)
+                        self.serial.write(self.tx_encoder.encode(text))
+                        if self.echo:
+                            self.console.write(key)
+        except serial.SerialException as exc:
+            self.writer_error = exc
+            self.alive = False
+
+    def handle_menu_key(self, key):
+        if key in "bB":
+            self.change_baudrate()
+        elif key in "qQ":
+            self.stop()
+        elif key in "\x08hH?":
+            sys.stderr.write(self.get_help_text())
+        elif key == self.menu_character or key == self.exit_character:
+            self.serial.write(self.tx_encoder.encode(key))
+        else:
+            sys.stderr.write(f"--- unsupported menu character {miniterm.key_description(key)} ---\n")
+
+    def get_help_text(self):
+        return (
+            "\n--- adbuart miniterm help\n"
+            f"--- {miniterm.key_description(self.exit_character):8} Exit program\n"
+            f"--- {miniterm.key_description(self.menu_character):8} Menu escape key, followed by:\n"
+            "---    b          change baud rate\n"
+            "---    q          exit program\n"
+            "---    h          show this help\n"
+        )
+
+
 class BridgeRuntime:
     def __init__(self, adb, node_path, slave_path, lock, startup_rtos_state, cmd_after=None):
         self.adb = adb
@@ -418,6 +608,42 @@ class BridgeRuntime:
         remove_symlink_if_owned(self.node_path, self.slave_path)
         self.restore_ok = run_cmd_after(self.adb, self.startup_rtos_state, self.cmd_after)
         self.lock.release()
+        print(f"teardown complete: {reason}", file=sys.stderr)
+        return self.restore_ok
+
+
+class TerminalRuntime:
+    def __init__(self, adb, startup_rtos_state, cmd_after=None):
+        self.adb = adb
+        self.startup_rtos_state = startup_rtos_state
+        self.cmd_after = cmd_after
+        self.adb_proc = None
+        self.restore_ok = None
+        self._torn_down = False
+
+    def teardown(self, reason):
+        if self._torn_down:
+            return self.restore_ok
+        self._torn_down = True
+        if self.adb_proc is not None and self.adb_proc.poll() is None:
+            try:
+                self.adb_proc.terminate()
+            except Exception as exc:
+                warn_stderr(f"failed to terminate adb terminal: {exc}")
+            try:
+                self.adb_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    self.adb_proc.kill()
+                except Exception as exc:
+                    warn_stderr(f"failed to kill adb terminal: {exc}")
+                try:
+                    self.adb_proc.wait(timeout=2)
+                except Exception as exc:
+                    warn_stderr(f"failed waiting for killed adb terminal: {exc}")
+            except Exception as exc:
+                warn_stderr(f"failed waiting for adb terminal: {exc}")
+        self.restore_ok = run_cmd_after(self.adb, self.startup_rtos_state, self.cmd_after)
         print(f"teardown complete: {reason}", file=sys.stderr)
         return self.restore_ok
 
@@ -562,6 +788,75 @@ def run_bridge(args, tmp_dir="/tmp"):
         _active_runtime = None
 
 
+def run_terminal(args):
+    global _active_runtime
+    adb = Adb(args.serial)
+    startup_state = ""
+    runtime = None
+    terminal = None
+    console_ready = False
+    try:
+        startup_state = prepare_remote_uart(adb, args.cmd_before, args.cmd_after)
+        runtime = TerminalRuntime(adb, startup_state, args.cmd_after)
+        runtime.adb_proc = adb.popen_shell_t(
+            build_remote_command(args.remote_tty, args.baud),
+            stderr=None,
+        )
+        _active_runtime = runtime
+        serial_port = AdbSerial(
+            runtime.adb_proc,
+            f"adb:{args.serial}:{args.remote_tty}",
+            args.baud,
+            set_baudrate=lambda baud: adb.shell(build_stty_command(args.remote_tty, str(baud))),
+        )
+        terminal = AdbMiniterm(serial_port, echo=False, eol="crlf", filters=("direct",))
+        terminal.reader_error = None
+        terminal.writer_error = None
+        terminal.set_rx_encoding("UTF-8")
+        terminal.set_tx_encoding("UTF-8")
+        print(f"--- Miniterm on {serial_port.name}  {args.baud},8,N,1 ---", file=sys.stderr)
+        print("--- Quit: Ctrl+] | Menu: Ctrl+T | Help: Ctrl+T followed by Ctrl+H ---", file=sys.stderr)
+        terminal.start()
+        console_ready = True
+        terminal.join(True)
+        terminal.join()
+        terminal.console.cleanup()
+        console_ready = False
+        stream_ended = terminal.reader_error is not None or terminal.writer_error is not None or runtime.adb_proc.poll() is not None
+        restore_ok = runtime.teardown("terminal ended")
+        if stream_ended or restore_ok is False:
+            return 1
+        return 0
+    except PrepareRemoteUartError as exc:
+        startup_state = exc.startup_state
+        run_cmd_after(adb, startup_state, args.cmd_after)
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        startup_state = getattr(exc, "startup_state", startup_state)
+        if terminal is not None:
+            terminal.stop()
+        if runtime is not None:
+            runtime.teardown(str(exc))
+        else:
+            run_cmd_after(adb, startup_state, args.cmd_after)
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except BaseException as exc:
+        startup_state = getattr(exc, "startup_state", startup_state)
+        if terminal is not None:
+            terminal.stop()
+        if runtime is not None:
+            runtime.teardown(str(exc))
+        else:
+            run_cmd_after(adb, startup_state, args.cmd_after)
+        raise
+    finally:
+        if terminal is not None and console_ready:
+            terminal.console.cleanup()
+        _active_runtime = None
+
+
 def main(argv: list[str] | None = None) -> int:
     install_signal_handlers()
     args = parse_args(argv)
@@ -570,6 +865,8 @@ def main(argv: list[str] | None = None) -> int:
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    if args.name is None:
+        return run_terminal(args)
     return run_bridge(args)
 
 

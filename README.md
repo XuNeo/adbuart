@@ -1,8 +1,8 @@
 # adbuart
 
-Expose an Android-device UART as a local PTY over `adb`, so host serial tools such as `minicom`, `picocom`, or pyserial can talk to it like a normal serial port.
+Open an Android-device UART in a local miniterm session over `adb`, or expose it as a local PTY for tools such as `minicom`, `picocom`, and pyserial.
 
-This is useful when a device has no host-side USB serial adapter and the console is reachable only through an Android UART device.
+This is useful when a device has no host-side USB serial adapter and its console is reachable only through an Android UART device.
 
 ## Requirements
 
@@ -19,21 +19,27 @@ python3 -m pip install adbuart
 
 ## Usage
 
-Start the bridge in one terminal:
+Open the UART directly in miniterm:
 
 ```bash
-adbuart -n uart-console
+adbuart
 ```
 
 With multiple adb devices attached, pass the adb serial explicitly:
 
 ```bash
-adbuart -s SERIAL -n uart-console
+adbuart -s SERIAL
 ```
 
-The command creates `/tmp/uart-console` and keeps running in the foreground. It prints a minicom command when the PTY is ready.
+Press `Ctrl+]` to exit, or `Ctrl+T` followed by `Ctrl+H` for miniterm help.
 
-Open the PTY from another terminal:
+To create a PTY for another serial tool instead, pass a name:
+
+```bash
+adbuart -n uart-console
+```
+
+This creates `/tmp/uart-console` and keeps the bridge running in the foreground. Open it from another terminal:
 
 ```bash
 minicom -D /tmp/uart-console -b 2000000
@@ -41,7 +47,7 @@ minicom -D /tmp/uart-console -b 2000000
 python3 -m serial.tools.miniterm /tmp/uart-console 2000000
 ```
 
-Stop the bridge with `Ctrl-C` in the bridge terminal. Clean shutdown restores RTOS logging when it was enabled before startup.
+Stop PTY mode with `Ctrl-C` in the bridge terminal. Clean shutdown in either mode restores RTOS logging when it was enabled before startup.
 
 ## Options
 
@@ -54,7 +60,8 @@ adbuart --version
 
 Important options:
 
-- `-n, --name` creates `/tmp/<name>` and is required.
+- Without `--name`, the command opens the UART directly in miniterm.
+- `-n, --name` creates `/tmp/<name>` for use by another serial tool instead.
 - `-s, --serial` selects an adb device. If omitted, exactly one device must be connected.
 - `--remote-tty` selects the target UART device path. Default: `/dev/ttyHS1`.
 - `--baud` sets the initial remote UART baud rate. Default: `2000000`.
@@ -66,8 +73,8 @@ By default the tool sets `persist.rtoslogd.uart` to `0` before bridging so Andro
 ## Operating notes
 
 - The bridge owns the target UART exclusively while it is running. Stop it before flashing, resetting, or opening the same UART through another tool.
-- The local node is protected with a lock file, but unrelated tools can still collide at the device UART level.
-- Avoid `kill -9`; it skips teardown and can leave RTOS logging disabled or a stale `/tmp/<name>` symlink.
+- In PTY mode, the local node is protected with a lock file, but unrelated tools can still collide at the device UART level.
+- Avoid `kill -9`; it skips teardown and can leave RTOS logging disabled or, in PTY mode, a stale `/tmp/<name>` symlink.
 - Serial disconnects during target reset are normal. Restart the bridge after the adb UART stream closes.
 
 ## Development
