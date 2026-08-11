@@ -1,8 +1,15 @@
 import codecs
+from pathlib import Path
 
 import pytest
 
 from adbuart import __version__, cli
+
+
+def test_package_version_matches_project_metadata():
+    pyproject = Path(__file__).parents[1] / "pyproject.toml"
+
+    assert f'version = "{__version__}"' in pyproject.read_text()
 
 
 def test_parse_args_keeps_name_and_defaults():
