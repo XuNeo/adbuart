@@ -40,6 +40,14 @@ def warn_stderr(message):
     print(f"warning: {message}", file=sys.stderr)
 
 
+def report_session_error(adb_returncode, error=None):
+    message = str(error) if error is not None else None
+    if adb_returncode is not None or message == "ADB UART stream closed":
+        print("error: ADB connection lost", file=sys.stderr)
+    elif message is not None:
+        print(f"error: adbuart internal error: {message}", file=sys.stderr)
+
+
 def validate_name(name: str) -> str:
     if not name or name in (".", ".."):
         raise ValueError("--name must be a non-empty basename")
@@ -751,6 +759,7 @@ def run_bridge(args, tmp_dir="/tmp"):
         print("Press Ctrl-C here to teardown.", file=sys.stderr)
         forward_loop(master_fd, runtime.adb_proc, baud_sync=baud_sync)
         adb_returncode = runtime.adb_proc.poll()
+        report_session_error(adb_returncode)
         restore_ok = runtime.teardown("forward loop ended")
         if adb_returncode not in (None, 0):
             return 1
@@ -822,7 +831,9 @@ def run_terminal(args):
         terminal.join()
         terminal.console.cleanup()
         console_ready = False
-        stream_ended = terminal.reader_error is not None or terminal.writer_error is not None or runtime.adb_proc.poll() is not None
+        adb_returncode = runtime.adb_proc.poll()
+        report_session_error(adb_returncode, terminal.reader_error or terminal.writer_error)
+        stream_ended = terminal.reader_error is not None or terminal.writer_error is not None or adb_returncode is not None
         restore_ok = runtime.teardown("terminal ended")
         if stream_ended or restore_ok is False:
             return 1

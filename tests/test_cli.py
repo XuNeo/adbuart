@@ -255,8 +255,7 @@ def test_adb_miniterm_writer_consumes_buffered_input(monkeypatch):
     assert terminal.alive is False
 
 
-@pytest.mark.parametrize("process_returncode, expected", [(None, 0), (1, 1)])
-def test_run_terminal_starts_miniterm_and_tears_down(monkeypatch, process_returncode, expected):
+def run_fake_terminal(monkeypatch, process_returncode=None, reader_error=None, writer_error=None):
     events = []
     process = FakeProcess(returncode=process_returncode)
     adb = type("FakeAdb", (), {"popen_shell_t": lambda self, command, stderr=None: process})()
@@ -282,6 +281,9 @@ def test_run_terminal_starts_miniterm_and_tears_down(monkeypatch, process_return
 
         def join(self, transmit_only=False):
             events.append(("join", transmit_only))
+            if not transmit_only:
+                self.reader_error = reader_error
+                self.writer_error = writer_error
 
         def stop(self):
             events.append("stop")
@@ -301,7 +303,14 @@ def test_run_terminal_starts_miniterm_and_tears_down(monkeypatch, process_return
     monkeypatch.setattr(cli, "AdbMiniterm", FakeMiniterm)
     args = cli.parse_args(["--serial", "SERIAL"])
 
-    assert cli.run_terminal(args) == expected
+    return cli.run_terminal(args), events
+
+
+@pytest.mark.parametrize("process_returncode, expected", [(None, 0), (1, 1)])
+def test_run_terminal_starts_miniterm_and_tears_down(monkeypatch, process_returncode, expected):
+    result, events = run_fake_terminal(monkeypatch, process_returncode=process_returncode)
+
+    assert result == expected
     assert events == [
         ("init", "adb:SERIAL:/dev/ttyHS1", False, "crlf", ("direct",)),
         ("rx", "UTF-8"),
@@ -312,6 +321,72 @@ def test_run_terminal_starts_miniterm_and_tears_down(monkeypatch, process_return
         "cleanup",
         ("teardown", "terminal ended"),
     ]
+
+
+def error_lines(captured):
+    return [line for line in captured.err.splitlines() if line.startswith("error:")]
+
+
+def test_run_terminal_reports_adb_disconnect_once(monkeypatch, capsys):
+    result, _ = run_fake_terminal(
+        monkeypatch,
+        process_returncode=0,
+        reader_error=cli.serial.SerialException("ADB UART stream closed"),
+    )
+
+    assert result == 1
+    assert error_lines(capsys.readouterr()) == ["error: ADB connection lost"]
+
+
+def test_run_terminal_reports_internal_error_once(monkeypatch, capsys):
+    result, _ = run_fake_terminal(
+        monkeypatch,
+        writer_error=cli.serial.SerialException("failed to write ADB UART stream: pipe closed"),
+    )
+
+    assert result == 1
+    assert error_lines(capsys.readouterr()) == [
+        "error: adbuart internal error: failed to write ADB UART stream: pipe closed"
+    ]
+
+
+def test_run_bridge_reports_adb_exit_code(monkeypatch, capsys):
+    process = FakeProcess(returncode=1)
+    adb = type("FakeAdb", (), {"popen_shell_t": lambda self, command: process})()
+
+    class FakeLock:
+        def __init__(self, path):
+            pass
+
+        def acquire(self):
+            pass
+
+        def release(self):
+            pass
+
+    class FakeRuntime:
+        def __init__(self, *args):
+            self.adb_proc = None
+            self.pty_fd = None
+            self.slave_fd = None
+
+        def teardown(self, reason):
+            return True
+
+    monkeypatch.setattr(cli, "LocalLock", FakeLock)
+    monkeypatch.setattr(cli, "Adb", lambda serial_number: adb)
+    monkeypatch.setattr(cli, "prepare_remote_uart", lambda adb_value, before, after: "1")
+    monkeypatch.setattr(cli.pty, "openpty", lambda: (7, 8))
+    monkeypatch.setattr(cli.os, "ttyname", lambda fd: "/dev/pts/1")
+    monkeypatch.setattr(cli, "_fd_is_tty", lambda fd: False)
+    monkeypatch.setattr(cli, "create_symlink", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "BridgeRuntime", FakeRuntime)
+    monkeypatch.setattr(cli, "build_remote_command", lambda remote_tty, baud: "REMOTE")
+    monkeypatch.setattr(cli, "forward_loop", lambda *args, **kwargs: None)
+    args = cli.parse_args(["--serial", "SERIAL", "--name", "uart-console"])
+
+    assert cli.run_bridge(args) == 1
+    assert error_lines(capsys.readouterr()) == ["error: ADB connection lost"]
 
 
 def test_build_remote_command_keeps_existing_shape():
