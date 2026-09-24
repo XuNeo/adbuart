@@ -2,17 +2,25 @@
 import argparse
 import codecs
 import errno
-import fcntl
 import os
-import pty
 import re
 import select
 import signal
 import subprocess
 import sys
-import termios
+import threading
 import time
-import tty
+
+if os.name == "posix":
+    import fcntl
+    import pty
+    import termios
+    import tty
+else:
+    fcntl = None
+    pty = None
+    termios = None
+    tty = None
 
 import serial
 from serial.tools import miniterm
@@ -28,11 +36,13 @@ DEFAULT_CMD_BEFORE = "setprop persist.rtoslogd.uart 0"
 DEFAULT_CMD_AFTER = "setprop persist.rtoslogd.uart 1"
 BAUD_SYNC_POLL_MS = 20
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+WINDOWS_HOST = os.name == "nt"
+PTY_BRIDGE_SUPPORTED = os.name == "posix"
 BAUD_TO_TERMIOS = {
     name[1:]: value
     for name, value in vars(termios).items()
     if name.startswith("B") and name[1:].isdigit()
-}
+} if PTY_BRIDGE_SUPPORTED else {}
 TERMIOS_TO_BAUD = {value: name for name, value in BAUD_TO_TERMIOS.items()}
 
 
@@ -67,7 +77,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--serial",
         help="ADB serial, passed to every adb command with -s; auto-selects when exactly one device is connected",
     )
-    parser.add_argument("-n", "--name", type=validate_name, help="Create a local /tmp/<name> PTY instead of opening miniterm")
+    parser.add_argument("-n", "--name", type=validate_name, help="Create a local /tmp/<name> PTY instead of opening miniterm (POSIX only)")
     parser.add_argument("--remote-tty", default=DEFAULT_REMOTE_TTY, help=f"Remote UART device path (default: {DEFAULT_REMOTE_TTY})")
     parser.add_argument("--baud", default=DEFAULT_BAUD, help=f"Remote UART baud rate for stty (default: {DEFAULT_BAUD})")
     parser.add_argument(
@@ -393,6 +403,31 @@ class AdbSerial:
         self.break_condition = False
         self.is_open = True
         self._cancel_read = False
+        self._windows_host = WINDOWS_HOST
+        if self._windows_host:
+            self._read_condition = threading.Condition()
+            self._read_buffer = bytearray()
+            self._read_eof = False
+            self._read_error = None
+            self._reader_thread = threading.Thread(target=self._read_stdout, name="adb-stdout", daemon=True)
+            self._reader_thread.start()
+
+    def _read_stdout(self):
+        read = getattr(self.adb_proc.stdout, "read1", self.adb_proc.stdout.read)
+        try:
+            while True:
+                data = read(COPY_SIZE)
+                with self._read_condition:
+                    if not data:
+                        self._read_eof = True
+                        self._read_condition.notify_all()
+                        return
+                    self._read_buffer.extend(data)
+                    self._read_condition.notify_all()
+        except Exception as exc:
+            with self._read_condition:
+                self._read_error = exc
+                self._read_condition.notify_all()
 
     @property
     def baudrate(self):
@@ -412,6 +447,9 @@ class AdbSerial:
 
     @property
     def in_waiting(self):
+        if self._windows_host:
+            with self._read_condition:
+                return len(self._read_buffer)
         if self.adb_proc.poll() is not None:
             return 0
         try:
@@ -437,6 +475,20 @@ class AdbSerial:
         return False
 
     def read(self, size=1):
+        if self._windows_host:
+            with self._read_condition:
+                while not self._read_buffer and not self._cancel_read and not self._read_eof and self._read_error is None:
+                    self._read_condition.wait()
+                if self._cancel_read:
+                    self._cancel_read = False
+                    return b""
+                if self._read_buffer:
+                    data = bytes(self._read_buffer[:size])
+                    del self._read_buffer[:size]
+                    return data
+                if self._read_error is not None:
+                    raise serial.SerialException(f"failed to read ADB UART stream: {self._read_error}")
+                raise serial.SerialException("ADB UART stream closed")
         if self._cancel_read:
             self._cancel_read = False
             return b""
@@ -475,7 +527,12 @@ class AdbSerial:
         self.adb_proc.stdin.flush()
 
     def cancel_read(self):
-        self._cancel_read = True
+        if self._windows_host:
+            with self._read_condition:
+                self._cancel_read = True
+                self._read_condition.notify_all()
+        else:
+            self._cancel_read = True
 
     def close(self):
         self.is_open = False
@@ -499,8 +556,20 @@ class AdbMiniterm(miniterm.Miniterm):
         except Exception as exc:
             self.reader_error = exc
             self.alive = False
+            if WINDOWS_HOST:
+                try:
+                    self.console.cancel()
+                except Exception:
+                    pass
 
     def writer(self):
+        if WINDOWS_HOST:
+            try:
+                super().writer()
+            except Exception as exc:
+                self.writer_error = exc
+                self.alive = False
+            return
         menu_active = False
         input_decoder = codecs.getincrementaldecoder(sys.stdin.encoding or "UTF-8")("replace")
         poller = select.poll()
@@ -725,6 +794,9 @@ def cleanup_before_runtime(paths, lock, adb, startup_state, cmd_after, master_fd
 
 def run_bridge(args, tmp_dir="/tmp"):
     global _active_runtime
+    if not PTY_BRIDGE_SUPPORTED:
+        print("error: --name requires POSIX PTY support; omit --name to use direct miniterm", file=sys.stderr)
+        return 2
     paths = BridgePaths(args.name, tmp_dir=tmp_dir)
     lock = LocalLock(paths.lock_path)
     lock.acquire()
@@ -871,6 +943,9 @@ def run_terminal(args):
 def main(argv: list[str] | None = None) -> int:
     install_signal_handlers()
     args = parse_args(argv)
+    if args.name is not None and not PTY_BRIDGE_SUPPORTED:
+        print("error: --name requires POSIX PTY support; omit --name to use direct miniterm", file=sys.stderr)
+        return 2
     try:
         args.serial = resolve_serial(args.serial)
     except RuntimeError as exc:

@@ -6,7 +6,8 @@ This is useful when a device has no host-side USB serial adapter and its console
 
 ## Requirements
 
-- Linux or another POSIX-like host with Python 3.10+
+- Windows, macOS, or Linux with Python 3.10+ for direct miniterm mode
+- A POSIX host for the optional local PTY mode
 - `adb` installed and available in `PATH`
 - An adb-connected Android device where `adb root` is allowed
 - Target-side UART device access, defaulting to `/dev/ttyHS1`
@@ -33,7 +34,7 @@ adbuart -s SERIAL
 
 Press `Ctrl+]` to exit, or `Ctrl+T` followed by `Ctrl+H` for miniterm help.
 
-To create a PTY for another serial tool instead, pass a name:
+On Linux or macOS, create a PTY for another serial tool by passing a name:
 
 ```bash
 adbuart -n uart-console
@@ -61,7 +62,7 @@ adbuart --version
 Important options:
 
 - Without `--name`, the command opens the UART directly in miniterm.
-- `-n, --name` creates `/tmp/<name>` for use by another serial tool instead.
+- `-n, --name` creates `/tmp/<name>` for use by another serial tool on POSIX hosts; Windows direct mode does not create a virtual COM port.
 - `-s, --serial` selects an adb device. If omitted, exactly one device must be connected.
 - `--remote-tty` selects the target UART device path. Default: `/dev/ttyHS1`.
 - `--baud` sets the initial remote UART baud rate. Default: `2000000`.

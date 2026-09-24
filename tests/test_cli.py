@@ -1,5 +1,6 @@
 import codecs
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -71,6 +72,7 @@ def test_missing_name_selects_direct_terminal_mode():
 
 
 def test_main_selects_bridge_when_name_is_set(monkeypatch):
+    monkeypatch.setattr(cli, "PTY_BRIDGE_SUPPORTED", True)
     monkeypatch.setattr(cli, "install_signal_handlers", lambda: None)
     monkeypatch.setattr(cli, "resolve_serial", lambda serial: "SERIAL")
     monkeypatch.setattr(cli, "run_bridge", lambda args: ("bridge", args.serial))
@@ -86,6 +88,15 @@ def test_main_selects_terminal_when_name_is_missing(monkeypatch):
     monkeypatch.setattr(cli, "run_terminal", lambda args: ("terminal", args.serial))
 
     assert cli.main([]) == ("terminal", "SERIAL")
+
+
+def test_main_rejects_bridge_before_resolving_device(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "PTY_BRIDGE_SUPPORTED", False)
+    monkeypatch.setattr(cli, "install_signal_handlers", lambda: None)
+    monkeypatch.setattr(cli, "resolve_serial", lambda serial: pytest.fail("device resolved"))
+
+    assert cli.main(["--name", "uart-console"]) == 2
+    assert "requires POSIX PTY support" in capsys.readouterr().err
 
 
 class FakePipe:
@@ -135,7 +146,7 @@ def test_adb_serial_adapter_reads_and_writes_process_pipes():
     stdin = FakePipe()
     serial_port = cli.AdbSerial(FakeProcess(stdout=stdout, stdin=stdin), "adb:SERIAL:/dev/ttyHS1", "2000000")
 
-    assert serial_port.read(1) == b"NSH> "
+    assert serial_port.read(5) == b"NSH> "
     assert serial_port.write(b"help\r\n") == 6
     assert stdin.writes == [b"help\r\n"]
     assert stdin.flush_count == 1
@@ -181,6 +192,7 @@ def test_adb_serial_adapter_cancel_read_keeps_process_alive():
     assert serial_port.read(1) == b"N"
 
 
+@pytest.mark.skipif(not cli.PTY_BRIDGE_SUPPORTED, reason="POSIX pipe polling")
 def test_adb_serial_adapter_reads_no_more_than_requested(monkeypatch):
     read_sizes = []
     stdout = type("FdPipe", (), {"fileno": lambda self: 7})()
@@ -193,6 +205,39 @@ def test_adb_serial_adapter_reads_no_more_than_requested(monkeypatch):
 
     assert serial_port.read(1) == b"N"
     assert read_sizes == [1]
+
+
+def test_windows_adb_serial_buffers_and_cancels_reads(monkeypatch):
+    ready = threading.Event()
+    release = threading.Event()
+
+    class BlockingPipe(FakePipe):
+        def read(self, size):
+            ready.set()
+            release.wait(1)
+            if self.reads:
+                return self.reads.pop(0)
+            return b""
+
+    monkeypatch.setattr(cli, "WINDOWS_HOST", True)
+    process = FakeProcess(stdout=BlockingPipe([b"NSH> ", b""]))
+    serial_port = cli.AdbSerial(process, "adb:SERIAL:/dev/ttyHS1", "2000000")
+    assert ready.wait(1)
+
+    result = []
+    reader = threading.Thread(target=lambda: result.append(serial_port.read(1)))
+    reader.start()
+    serial_port.cancel_read()
+    reader.join(1)
+
+    assert result == [b""]
+    assert process.terminate_count == 0
+
+    release.set()
+    serial_port._reader_thread.join(1)
+    assert serial_port.in_waiting == 5
+    assert serial_port.read(2) == b"NS"
+    assert serial_port.in_waiting == 3
 
 
 def test_adb_miniterm_reader_stops_on_adb_eof_without_console_cancel():
@@ -231,6 +276,39 @@ def test_adb_miniterm_reader_stops_when_console_output_closes():
     assert isinstance(terminal.reader_error, BrokenPipeError)
 
 
+def test_windows_miniterm_reader_cancels_console_on_disconnect(monkeypatch):
+    cancelled = []
+    terminal = object.__new__(cli.AdbMiniterm)
+    terminal.serial = type("Serial", (), {
+        "in_waiting": 1,
+        "read": lambda self, size: (_ for _ in ()).throw(cli.serial.SerialException("closed")),
+    })()
+    terminal.console = type("Console", (), {"cancel": lambda self: cancelled.append(True)})()
+    terminal.alive = True
+    terminal._reader_alive = True
+    terminal.reader_error = None
+    monkeypatch.setattr(cli, "WINDOWS_HOST", True)
+
+    terminal.reader()
+
+    assert cancelled == [True]
+    assert isinstance(terminal.reader_error, cli.serial.SerialException)
+
+
+def test_windows_miniterm_uses_pyserial_writer(monkeypatch):
+    calls = []
+    terminal = object.__new__(cli.AdbMiniterm)
+    terminal.writer_error = None
+    monkeypatch.setattr(cli, "WINDOWS_HOST", True)
+    monkeypatch.setattr(cli.miniterm.Miniterm, "writer", lambda self: calls.append(True))
+
+    terminal.writer()
+
+    assert calls == [True]
+    assert terminal.writer_error is None
+
+
+@pytest.mark.skipif(not cli.PTY_BRIDGE_SUPPORTED, reason="POSIX console polling")
 def test_adb_miniterm_writer_consumes_buffered_input(monkeypatch):
     writes = []
     terminal = object.__new__(cli.AdbMiniterm)
@@ -350,7 +428,9 @@ def test_run_terminal_reports_internal_error_once(monkeypatch, capsys):
     ]
 
 
+@pytest.mark.skipif(not cli.PTY_BRIDGE_SUPPORTED, reason="POSIX PTY bridge")
 def test_run_bridge_reports_adb_exit_code(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "PTY_BRIDGE_SUPPORTED", True)
     process = FakeProcess(returncode=1)
     adb = type("FakeAdb", (), {"popen_shell_t": lambda self, command: process})()
 
