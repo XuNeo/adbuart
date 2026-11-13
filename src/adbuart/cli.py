@@ -28,7 +28,7 @@ from serial.tools import miniterm
 try:
     from . import __version__
 except ImportError:  # pragma: no cover - direct script execution fallback
-    __version__ = "0.1.3"
+    __version__ = "0.1.4"
 
 DEFAULT_REMOTE_TTY = "/dev/ttyHS1"
 DEFAULT_BAUD = "2000000"
